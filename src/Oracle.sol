@@ -47,9 +47,6 @@ interface OracleEvents {
     );
 }
 
-/// @title Oracle
-/// @notice The oracle contract stores records which are snapshots of consensus layer state over discrete periods of
-/// time. These records provide consensus layer data to the protocol's onchain contracts for their accounting logic.
 contract Oracle is Initializable, AccessControlEnumerableUpgradeable, IOracle, OracleEvents, ProtocolEvents {
     // Errors.
     error CannotUpdateWhileUpdatePending();
@@ -67,50 +64,29 @@ contract Oracle is Initializable, AccessControlEnumerableUpgradeable, IOracle, O
     error UpdateEndBlockNumberNotFinal(uint256 updateFinalizingBlock);
     error ZeroAddress();
 
-    /// @notice Role allowed to modify the settable properties on the contract.
-    bytes32 public constant ORACLE_MANAGER_ROLE = keccak256("ORACLE_MANAGER_ROLE");
-
-    /// @notice Role allowed to modify an existing oracle record.
-    bytes32 public constant ORACLE_MODIFIER_ROLE = keccak256("ORACLE_MODIFIER_ROLE");
-
-    /// @notice Role allowed to resolve or replace pending oracle updates which have failed the sanity check.
-    bytes32 public constant ORACLE_PENDING_UPDATE_RESOLVER_ROLE = keccak256("ORACLE_PENDING_UPDATE_RESOLVER_ROLE");
+    //角色权限定义
+    bytes32 public constant ORACLE_MANAGER_ROLE = keccak256("ORACLE_MANAGER_ROLE");    // Oracle管理员角色
+    bytes32 public constant ORACLE_MODIFIER_ROLE = keccak256("ORACLE_MODIFIER_ROLE");  //  Oracle记录修改员角色
+    bytes32 public constant ORACLE_PENDING_UPDATE_RESOLVER_ROLE = keccak256("ORACLE_PENDING_UPDATE_RESOLVER_ROLE");  // 待处理更新解决角色
 
     /// @notice Finalization block number delta upper bound for the setter.
     uint256 internal constant _FINALIZATION_BLOCK_NUMBER_DELTA_UPPER_BOUND = 2048;
 
-    /// @notice Stores the oracle records.
-    /// @dev Must not be pushed directly to, use `_pushRecord` instead.
-    OracleRecord[] internal _records;
+    //数据存储
+    OracleRecord[] internal _records;    // Oracle记录数组（历史快照）
 
-    /// @inheritdoc IOracleReadPending
-    bool public hasPendingUpdate;
+    // 待处理更新机制
+    bool public hasPendingUpdate;           // 是否有待处理的更新
+    OracleRecord internal _pendingUpdate;   // 待处理的更新记录（如果合理性检查失败）
 
-    /// @notice The pending oracle update, if it was rejected by `_sanityCheckUpdate`.
-    /// @dev Undefined if `hasPendingUpdate` is false.
-    OracleRecord internal _pendingUpdate;
+    // 确认机制参数
+    uint256 public finalizationBlockNumberDelta;  // 确认所需要的区块数差值（默认2个 epoch）
+    address public oracleUpdater;  // 允许推送 Oracle 更新的地址
 
-    // @notice The number of blocks which must have passed before we accept an oracle update to ensure that the analysed
-    // period is finalised.
-    // NOTE: We cannot make guarantees about the consensus layer's state, but it is expected that
-    // finalisation takes 2 epochs.
-    uint256 public finalizationBlockNumberDelta;
-
-    /// @notice The address allowed to push oracle updates.
-    address public oracleUpdater;
-
-    /// @notice The pauser contract.
-    /// @dev Keeps the pause state across the protocol.
-    IPauser public pauser;
-
-    /// @notice The staking contract.
-    /// @dev Quantities tracked by the staking contract during validator initiation are used to sanity check oracle
-    /// updates.
-    IStakingInitiationRead public staking;
-
-    /// @notice The aggregator contract.
-    /// @dev Called when pushing an oracle record to process.
-    IReturnsAggregatorWrite public aggregator;
+    //核心合约引用
+    IPauser public pauser;  // 暂停合约
+    IStakingInitiationRead public staking;  // 质押合约
+    IReturnsAggregatorWrite public aggregator;  // 收益聚合器合约
 
     //
     // Sanity check parameters
@@ -212,12 +188,19 @@ contract Oracle is Initializable, AccessControlEnumerableUpgradeable, IOracle, O
         _pushRecord(OracleRecord(0, uint64(staking.initializationBlockNumber()), 0, 0, 0, 0, 0, 0));
     }
 
-    /// @inheritdoc IOracleWrite
-    /// @dev Reverts if the update is invalid. If the update is valid but does not pass the `_sanityCheckUpdate`, the
-    /// update is marked as pending and must be approved or replaced by the `ORACLE_PENDING_UPDATE_RESOLVER_ROLE`. If
-    /// the update fails the sanity check, it will also pause the protocol.
-    /// @param newRecord The oracle record to update to.
+    /** 合理性检查参数（重要的安全机制）
+     * 接收新的Oracle记录（只能由指定的oracleUpdater调用）
+     * @param newRecord 要更新的Oracle记录
+     *
+     * 执行流程：
+     * 1. 权限和暂停状态检查
+     * 2. 技术验证（严格的不变性检查）
+     * 3. 确认性检查（基于区块高度）
+     * 4. 合理性检查（边界和异常检测）
+     * 5. 根据检查结果决定接受、拒绝或暂停
+     */
     function receiveRecord(OracleRecord calldata newRecord) external {
+        // 1. 基础检查
         if (pauser.isSubmitOracleRecordsPaused()) {
             revert Paused();
         }
@@ -230,17 +213,23 @@ contract Oracle is Initializable, AccessControlEnumerableUpgradeable, IOracle, O
             revert CannotUpdateWhileUpdatePending();
         }
 
+        // 2. 技术验证-确保数据逻辑正确
         validateUpdate(_records.length - 1, newRecord);
 
+        // 3. 确认性检查-确保报告期间已最终确认
         uint256 updateFinalizingBlock = newRecord.updateEndBlock + finalizationBlockNumberDelta;
         if (block.number < updateFinalizingBlock) {
             revert UpdateEndBlockNumberNotFinal(updateFinalizingBlock);
         }
 
+        // 4. 合理性检查-检查数据是否在合理范围内
         (string memory rejectionReason, uint256 value, uint256 bound) = sanityCheckUpdate(latestRecord(), newRecord);
+
         if (bytes(rejectionReason).length > 0) {
+            // 合理性检查失败-标记为待处理并暂停协议
             _pendingUpdate = newRecord;
             hasPendingUpdate = true;
+
             emit OracleRecordFailedSanityCheck({
                 reasonHash: keccak256(bytes(rejectionReason)),
                 reason: rejectionReason,
@@ -248,27 +237,29 @@ contract Oracle is Initializable, AccessControlEnumerableUpgradeable, IOracle, O
                 value: value,
                 bound: bound
             });
-            // Failing the sanity check will pause the protocol providing the admins time to accept or reject the
-            // pending update.
+            // 重要：暂停协议等待管理员处理
             pauser.pauseAll();
             return;
         }
 
+        // 5. 检查通过-添加记录并处理收益
         _pushRecord(newRecord);
     }
 
-    /// @notice Modifies an existing record's balances due to errors or malicious behavior. Modifiying the latest
-    /// oracle record will have an effect on the total controlled supply, thereby altering the exchange rate.
-    /// Note that users who have already requested to unstake, and are in the queue, will not be affected by the new
-    /// exchange rate.
-    /// @dev This function should only be called in an emergency situation where the oracle has posted an invalid
-    /// record, either due to a calculations issue (or in the unlikely event of a compromise). If the new record
-    /// reports higher returns in the window, then we need to reprocess the difference. If the new record reports
-    /// lower returns in the window, then we need to top up the difference in the consensusLayerReceiver wallet. Without
-    /// adding the missing funds in the consensusLayerReceiver wallet this function will revert in the future.
-    /// @param idx The index of the oracle record to modify.
-    /// @param record The new oracle record that will modify the existing one.
+    /** 紧急记录修复功能
+     * 修改现有记录（紧急情况使用）
+     * @param idx 要修改的记录索引
+     * @param record 新的记录数据
+     *
+     * 使用场景：
+     * 1. Oracle计算错误
+     * 2. 恶意Oracle攻击后的数据修正
+     * 3. 链下系统故障导致的数据偏差
+     *
+     * 注意：这个函数会影响汇率，已提交解质押请求的用户不受影响
+     */
     function modifyExistingRecord(uint256 idx, OracleRecord calldata record) external onlyRole(ORACLE_MODIFIER_ROLE) {
+        // 不能修改初始记录（索引0）
         if (idx == 0) {
             revert CannotModifyInitialRecord();
         }
@@ -278,23 +269,20 @@ contract Oracle is Initializable, AccessControlEnumerableUpgradeable, IOracle, O
         }
 
         OracleRecord storage existingRecord = _records[idx];
-        // Cannot modify the bounds of the record to prevent gaps in the
-        // records.
-        if (
-            existingRecord.updateStartBlock != record.updateStartBlock
-                || existingRecord.updateEndBlock != record.updateEndBlock
-        ) {
+
+        // 不能修改记录的时间边界（防止出现时间间隙）
+        if ( existingRecord.updateStartBlock != record.updateStartBlock || existingRecord.updateEndBlock != record.updateEndBlock ) {
             revert InvalidRecordModification();
         }
 
+        // 对新记录进行技术验证
         validateUpdate(idx - 1, record);
 
-        // If the new record has a higher windowWithdrawnRewardAmount or windowWithdrawnPrincipalAmount, we need to
-        // process the difference. If this is the case, then when we processed the event, we didn't take enough from
-        // the consensus layer returns wallet.
+        // 计算修改后是否需要补充处理收益
         uint256 missingRewards = 0;
         uint256 missingPrincipals = 0;
 
+        // 如果新记录报告了更多的提取奖励/本金，需要补充处理
         if (record.windowWithdrawnRewardAmount > existingRecord.windowWithdrawnRewardAmount) {
             missingRewards = record.windowWithdrawnRewardAmount - existingRecord.windowWithdrawnRewardAmount;
         }
@@ -302,49 +290,52 @@ contract Oracle is Initializable, AccessControlEnumerableUpgradeable, IOracle, O
             missingPrincipals = record.windowWithdrawnPrincipalAmount - existingRecord.windowWithdrawnPrincipalAmount;
         }
 
+        // 更新记录
         _records[idx] = record;
         emit OracleRecordModified(idx, record);
 
-        // Move external call to the end to avoid any reentrancy issues.
+        // 如果有缺失的收益，触发补充处理（外部调用放在最后避免重入）
         if (missingRewards > 0 || missingPrincipals > 0) {
             aggregator.processReturns({
                 rewardAmount: missingRewards,
                 principalAmount: missingPrincipals,
-                shouldIncludeELRewards: false
+                shouldIncludeELRewards: false      // 修改时不包含执行层奖励
             });
         }
     }
 
-    /// @notice Check that the new oracle record is technically valid by comparing it to the previous
-    /// record.
-    /// @dev Reverts if the oracle record fails to pass validation. This is much stricter compared to the sanityCheck
-    /// as the validation logic ensures that our oracle invariants are kept intact.
-    /// @param prevRecordIndex The index of the previous record.
-    /// @param newRecord The oracle record to validate.
+    /** 技术验证函数
+     * 验证新Oracle记录的技术正确性
+     * @param prevRecordIndex 前一条记录的索引
+     * @param newRecord 新记录
+     *
+     * 这是最严格的验证，确保Oracle的不变性：
+     * 1. 时间窗口连续性
+     * 2. 累积数据单调性
+     * 3. 与链上数据一致性
+     */
     function validateUpdate(uint256 prevRecordIndex, OracleRecord calldata newRecord) public view {
         OracleRecord storage prevRecord = _records[prevRecordIndex];
+
+        // 验证1：时间窗口有效性
         if (newRecord.updateEndBlock <= newRecord.updateStartBlock) {
             revert InvalidUpdateEndBeforeStartBlock(newRecord.updateEndBlock, newRecord.updateStartBlock);
         }
 
-        // Ensure that oracle records are aligned i.e. making sure that the new record window picks up where the
-        // previous one left off.
+        // 验证2：时间窗口连续性（新记录必须紧接前一记录）
         if (newRecord.updateStartBlock != prevRecord.updateEndBlock + 1) {
             revert InvalidUpdateStartBlock(prevRecord.updateEndBlock + 1, newRecord.updateStartBlock);
         }
 
-        // Ensure that the offchain oracle has only tracked deposits from the protocol. The processed deposits on the
-        // consensus layer can be at most the amount of ether the protocol has deposited into the deposit contract.
+        // 验证3：存款处理一致性，链下Oracle只能跟踪来自协议的存款
         if (newRecord.cumulativeProcessedDepositAmount > staking.totalDepositedInValidators()) {
             revert InvalidUpdateMoreDepositsProcessedThanSent(
                 newRecord.cumulativeProcessedDepositAmount, staking.totalDepositedInValidators()
             );
         }
 
-        if (
-            uint256(newRecord.currentNumValidatorsNotWithdrawable)
-                + uint256(newRecord.cumulativeNumValidatorsWithdrawable) > staking.numInitiatedValidators()
-        ) {
+        // 验证4：验证器数量一致性，报告的验证器总数不能超过协议启动的数量
+        if ( uint256(newRecord.currentNumValidatorsNotWithdrawable) + uint256(newRecord.cumulativeNumValidatorsWithdrawable) > staking.numInitiatedValidators() ) {
             revert InvalidUpdateMoreValidatorsThanInitiated(
                 newRecord.currentNumValidatorsNotWithdrawable + newRecord.cumulativeNumValidatorsWithdrawable,
                 staking.numInitiatedValidators()
@@ -352,35 +343,27 @@ contract Oracle is Initializable, AccessControlEnumerableUpgradeable, IOracle, O
         }
     }
 
-    /// @notice Sanity checks an incoming oracle update. If it fails, the update is rejected and marked as pending to be
-    /// approved or replaced by the `ORACLE_PENDING_UPDATE_RESOLVER_ROLE`.
-    /// @dev If the record fails the sanity check, the function does not revert as we want to store the offending oracle
-    /// record in a pending state.
-    /// @param newRecord The incoming record to check.
-    /// @return A tuple containing the reason for the rejection, the value that failed the check and the bound that it
-    /// violated. The reason is the empty string if the update is valid.
-    function sanityCheckUpdate(OracleRecord memory prevRecord, OracleRecord calldata newRecord)
-        public
-        view
-        returns (string memory, uint256, uint256)
-    {
+    /**
+     * 对Oracle更新进行合理性检查
+     * @param prevRecord 前一条记录
+     * @param newRecord 新记录
+     * @return (拒绝原因, 异常值, 边界值) - 如果原因为空字符串则通过检查
+     *
+     * 合理性检查比技术验证更宽松，主要防止：
+     * 1. 恶意Oracle攻击
+     * 2. 计算错误
+     * 3. 异常市场条件
+     */
+    function sanityCheckUpdate(OracleRecord memory prevRecord, OracleRecord calldata newRecord) public view returns (string memory, uint256, uint256) {
         uint64 reportSize = newRecord.updateEndBlock - newRecord.updateStartBlock + 1;
         {
-            //
-            // Report size
-            //
-            // We implement this as a sanity check rather than a validation because the report is technically valid
-            // and there may be a feasible reason to accept small report at some point.
+            // 检查1：报告大小
             if (reportSize < minReportSizeBlocks) {
                 return ("Report blocks below minimum bound", reportSize, minReportSizeBlocks);
             }
         }
         {
-            //
-            // Number of validators
-            //
-            // Checks that the total number of validators and the number of validators that are in the withdrawable state
-            // did not decrease in the new oracle period.
+            // 检查2：验证器数量单调性
             if (newRecord.cumulativeNumValidatorsWithdrawable < prevRecord.cumulativeNumValidatorsWithdrawable) {
                 return (
                     "Cumulative number of withdrawable validators decreased",
@@ -389,10 +372,8 @@ contract Oracle is Initializable, AccessControlEnumerableUpgradeable, IOracle, O
                 );
             }
             {
-                uint256 prevNumValidators =
-                    prevRecord.currentNumValidatorsNotWithdrawable + prevRecord.cumulativeNumValidatorsWithdrawable;
-                uint256 newNumValidators =
-                    newRecord.currentNumValidatorsNotWithdrawable + newRecord.cumulativeNumValidatorsWithdrawable;
+                uint256 prevNumValidators = prevRecord.currentNumValidatorsNotWithdrawable + prevRecord.cumulativeNumValidatorsWithdrawable;
+                uint256 newNumValidators = newRecord.currentNumValidatorsNotWithdrawable + newRecord.cumulativeNumValidatorsWithdrawable;
 
                 if (newNumValidators < prevNumValidators) {
                     return ("Total number of validators decreased", newNumValidators, prevNumValidators);
@@ -401,12 +382,7 @@ contract Oracle is Initializable, AccessControlEnumerableUpgradeable, IOracle, O
         }
 
         {
-            //
-            // Deposits
-            //
-            // Checks that the total amount of deposits processed by the oracle did not decrease in the new oracle
-            // period. It also checks that the amount of newly deposited ETH is possible given how many validators
-            // we have included in the new period.
+            // 检查3：存款处理单调性
             if (newRecord.cumulativeProcessedDepositAmount < prevRecord.cumulativeProcessedDepositAmount) {
                 return (
                     "Processed deposit amount decreased",
@@ -415,8 +391,8 @@ contract Oracle is Initializable, AccessControlEnumerableUpgradeable, IOracle, O
                 );
             }
 
-            uint256 newDeposits =
-                (newRecord.cumulativeProcessedDepositAmount - prevRecord.cumulativeProcessedDepositAmount);
+            // 检查4：新存款与验证器比例合理性
+            uint256 newDeposits = (newRecord.cumulativeProcessedDepositAmount - prevRecord.cumulativeProcessedDepositAmount);
             uint256 newValidators = (
                 newRecord.currentNumValidatorsNotWithdrawable + newRecord.cumulativeNumValidatorsWithdrawable
                     - prevRecord.currentNumValidatorsNotWithdrawable - prevRecord.cumulativeNumValidatorsWithdrawable
@@ -435,61 +411,59 @@ contract Oracle is Initializable, AccessControlEnumerableUpgradeable, IOracle, O
             }
         }
 
-        {
-            //
-            // Consensus layer balance change from the previous period.
-            //
-            // Checks that the change in the consensus layer balance is within the bounds given by the maximum loss and
-            // minimum gain parameters. For example, a major slashing event will cause an out of bounds loss in the
-            // consensus layer.
-
-            // The baselineGrossCLBalance represents the expected growth of our validators balance in the new period
-            // given no slashings, no rewards, etc. It's used as the baseline in our upper (growth) and lower (loss)
-            // bounds calculations.
-            uint256 baselineGrossCLBalance = prevRecord.currentTotalValidatorBalance
-                + (newRecord.cumulativeProcessedDepositAmount - prevRecord.cumulativeProcessedDepositAmount);
-
-            // The newGrossCLBalance is the actual amount of ETH we have recorded in the consensus layer for the new
-            // record period.
-            uint256 newGrossCLBalance = newRecord.currentTotalValidatorBalance
-                + newRecord.windowWithdrawnPrincipalAmount + newRecord.windowWithdrawnRewardAmount;
-
-            {
-                // Relative lower bound on the net decrease of ETH on the consensus layer.
-                // Depending on the parameters the loss term might completely dominate over the minGain one.
-                //
-                // Using a minConsensusLayerGainPerBlockPPT greater than 0, the lower bound becomes an upward slope.
-                // Setting minConsensusLayerGainPerBlockPPT, the lower bound becomes a constant.
-                uint256 lowerBound = baselineGrossCLBalance
-                    - Math.mulDiv(maxConsensusLayerLossPPM, baselineGrossCLBalance, _PPM_DENOMINATOR)
-                    + Math.mulDiv(minConsensusLayerGainPerBlockPPT * reportSize, baselineGrossCLBalance, _PPT_DENOMINATOR);
-
-                if (newGrossCLBalance < lowerBound) {
-                    return ("Consensus layer change below min gain or max loss", newGrossCLBalance, lowerBound);
-                }
-            }
-            {
-                // Upper bound on the rewards generated by validators scaled linearly with time and number of active
-                // validators.
-                uint256 upperBound = baselineGrossCLBalance
-                    + Math.mulDiv(maxConsensusLayerGainPerBlockPPT * reportSize, baselineGrossCLBalance, _PPT_DENOMINATOR);
-
-                if (newGrossCLBalance > upperBound) {
-                    return ("Consensus layer change above max gain", newGrossCLBalance, upperBound);
-                }
-            }
-        }
-
-        return ("", 0, 0);
+        // 检查5：共识层余额变化合理性（核心检查！）
+        return _checkConsensusLayerBalanceChange(prevRecord, newRecord, reportSize);
     }
 
-    /// @dev Pushes a record to the list of records, emits an oracle added event, and processes the
-    /// oracle record in the aggregator.
-    /// @param record The record to push.
+    /**
+     * 检查共识层余额变化是否合理
+     * 这是最复杂也是最重要的检查
+     */
+    function _checkConsensusLayerBalanceChange(
+        OracleRecord memory prevRecord,
+        OracleRecord calldata newRecord,
+        uint64 reportSize
+    ) internal view returns (string memory, uint256, uint256) {
+
+        // 计算基准总余额（没有奖励/惩罚情况下的期望余额）
+        uint256 baselineGrossCLBalance = prevRecord.currentTotalValidatorBalance +
+            (newRecord.cumulativeProcessedDepositAmount - prevRecord.cumulativeProcessedDepositAmount);
+
+        // 计算实际总余额（包含所有提取的资金）
+        uint256 newGrossCLBalance = newRecord.currentTotalValidatorBalance +
+                        newRecord.windowWithdrawnPrincipalAmount +
+                        newRecord.windowWithdrawnRewardAmount;
+
+        // 下边界检查：防止异常损失
+        uint256 lowerBound = baselineGrossCLBalance
+            - Math.mulDiv(maxConsensusLayerLossPPM, baselineGrossCLBalance, _PPM_DENOMINATOR)  // 最大损失
+            + Math.mulDiv(minConsensusLayerGainPerBlockPPT * reportSize, baselineGrossCLBalance, _PPT_DENOMINATOR); // 最小收益
+
+        if (newGrossCLBalance < lowerBound) {
+            return ("Consensus layer change below min gain or max loss", newGrossCLBalance, lowerBound);
+        }
+
+        // 上边界检查：防止异常收益
+        uint256 upperBound = baselineGrossCLBalance +
+                            Math.mulDiv(maxConsensusLayerGainPerBlockPPT * reportSize, baselineGrossCLBalance, _PPT_DENOMINATOR);
+
+        if (newGrossCLBalance > upperBound) {
+            return ("Consensus layer change above max gain", newGrossCLBalance, upperBound);
+        }
+
+        return ("", 0, 0); // 检查通过
+    }
+
+    /** 记录处理和待处理更新管理
+     * 内部函数：推送记录到数组并触发收益处理
+     * @param record 要推送的记录
+     */
     function _pushRecord(OracleRecord memory record) internal {
         emit OracleRecordAdded(_records.length, record);
         _records.push(record);
 
+        // 重要：触发收益聚合器处理新的收益
+        // shouldIncludeELRewards=true 表示包含执行层奖励
         aggregator.processReturns({
             rewardAmount: record.windowWithdrawnRewardAmount,
             principalAmount: record.windowWithdrawnPrincipalAmount,
@@ -497,8 +471,10 @@ contract Oracle is Initializable, AccessControlEnumerableUpgradeable, IOracle, O
         });
     }
 
-    /// @notice Accepts the current pending update and adds it to the list of oracle records.
-    /// @dev Accepting the current pending update resets the update pending state.
+    /**
+     * 接受待处理的更新（管理员权限）
+     * 当合理性检查失败但管理员确认数据正确时使用
+     */
     function acceptPendingUpdate() external onlyRole(ORACLE_PENDING_UPDATE_RESOLVER_ROLE) {
         if (!hasPendingUpdate) {
             revert NoUpdatePending();
@@ -508,8 +484,10 @@ contract Oracle is Initializable, AccessControlEnumerableUpgradeable, IOracle, O
         _resetPending();
     }
 
-    /// @notice Rejects the current pending update.
-    /// @dev Rejecting the current pending update resets the pending state.
+    /**
+     * 拒绝待处理的更新（管理员权限）
+     * 当管理员确认数据有问题时使用
+     */
     function rejectPendingUpdate() external onlyRole(ORACLE_PENDING_UPDATE_RESOLVER_ROLE) {
         if (!hasPendingUpdate) {
             revert NoUpdatePending();
@@ -517,6 +495,12 @@ contract Oracle is Initializable, AccessControlEnumerableUpgradeable, IOracle, O
 
         emit OraclePendingUpdateRejected(_pendingUpdate);
         _resetPending();
+    }
+
+    //重置待处理状态
+    function _resetPending() internal {
+        delete _pendingUpdate;
+        hasPendingUpdate = false;
     }
 
     /// @inheritdoc IOracleReadRecord
@@ -540,12 +524,6 @@ contract Oracle is Initializable, AccessControlEnumerableUpgradeable, IOracle, O
     /// @inheritdoc IOracleReadRecord
     function numRecords() external view returns (uint256) {
         return _records.length;
-    }
-
-    /// @dev Resets the pending update by removing the update from storage and resetting the hasPendingUpdate flag.
-    function _resetPending() internal {
-        delete _pendingUpdate;
-        hasPendingUpdate = false;
     }
 
     /// @notice Sets the finalization block number delta in the contract.
