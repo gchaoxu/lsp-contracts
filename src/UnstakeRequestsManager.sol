@@ -2,8 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {Initializable} from "openzeppelin-upgradeable/proxy/utils/Initializable.sol";
-import {AccessControlEnumerableUpgradeable} from
-    "openzeppelin-upgradeable/access/AccessControlEnumerableUpgradeable.sol";
+import {AccessControlEnumerableUpgradeable} from "openzeppelin-upgradeable/access/AccessControlEnumerableUpgradeable.sol";
 import {Address} from "openzeppelin/utils/Address.sol";
 import {Math} from "openzeppelin/utils/math/Math.sol";
 import {SafeERC20Upgradeable} from "openzeppelin-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
@@ -70,8 +69,7 @@ interface UnstakeRequestsManagerEvents {
     );
 }
 
-/// @title UnstakeRequestsManager
-/// @notice Manages unstake requests from the staking contract.
+// 管理用户解质押请求的核心合约，采用先进先出（FIFO）队列机制处理解质押请求。它负责跟踪请求状态、管理资金分配、确定请求可认领的时机。
 contract UnstakeRequestsManager is
     Initializable,
     AccessControlEnumerableUpgradeable,
@@ -87,39 +85,25 @@ contract UnstakeRequestsManager is
     error NotRequester();
     error NotStakingContract();
 
-    /// @notice Role allowed to set properties of the contract.
-    bytes32 public constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
+    // 角色权限
+    bytes32 public constant MANAGER_ROLE = keccak256("MANAGER_ROLE");  // 管理员角色
+    bytes32 public constant REQUEST_CANCELLER_ROLE = keccak256("REQUEST_CANCELLER_ROLE");     // 请求取消角色
 
-    /// @notice Role that is allowed to cancel unfinalized requests if the protocol is in emergency state.
-    bytes32 public constant REQUEST_CANCELLER_ROLE = keccak256("REQUEST_CANCELLER_ROLE");
+    // 核心合约引用
+    IStakingReturnsWrite public stakingContract;   // 质押合约引用
+    IOracleReadRecord public oracle;  // 语言机合约引用
+    IMETH public mETH;   // mETH代币合约引用
 
-    /// @notice The staking contract to which the unstake requests manager accepts claims and new unstake requests from.
-    IStakingReturnsWrite public stakingContract;
+    // 资金跟踪状态变量
+    uint256 public allocatedETHForClaims;  // 已分配用于认领的ETH总量（从质押合约转入）
+    uint256 public totalClaimed;  // 已认领的 ETH 总量
+    uint128 public latestCumulativeETHRequested;  // 最新的累积ETH请求量
 
-    /// @notice The oracle contract that the finalization criteria relies on.
-    IOracleReadRecord public oracle;
+    //请求确认机制
+    uint256 public numberOfBlocksToFinalize;   // 请求确认所需的区块数
 
-    /// @notice The total amount of ether sent by the staking contract.
-    /// @dev This value can be decreased when reclaiming surplus allocatedETHs.
-    uint256 public allocatedETHForClaims;
-
-    /// @notice The total amount of ether claimed by requesters.
-    uint256 public totalClaimed;
-
-    /// @notice A request's block number on creation plus numberOfBlocksToFinalize determines
-    /// if the request is finalized.
-    uint256 public numberOfBlocksToFinalize;
-
-    /// @notice The mETH token contract.
-    /// @dev Tokens will be minted / burned during staking / unstaking.
-    IMETH public mETH;
-
-    /// @dev Cache the latest cumulative ETH requested value instead of checking latest element in the array.
-    /// This prevents encountering an invalid value if someone claims the request which resets it.
-    uint128 public latestCumulativeETHRequested;
-
-    /// @dev The internal queue of unstake requests.
-    UnstakeRequest[] internal _unstakeRequests;
+    // 请求队列（内部存储）
+    UnstakeRequest[] internal _unstakeRequests;  // 用于解质押请求数组（先进先出队列）
 
     /// @notice Configuration for contract initialization.
     struct Init {
@@ -151,57 +135,88 @@ contract UnstakeRequestsManager is
         _grantRole(REQUEST_CANCELLER_ROLE, init.requestCanceller);
     }
 
-    /// @inheritdoc IUnstakeRequestsManagerWrite
-    /// @dev Increases the cumulative ETH requested counter and pushes a new unstake request to the array. This function
-    /// can only be called by the staking contract.
-    function create(address requester, uint128 mETHLocked, uint128 ethRequested)
-        external
-        onlyStakingContract
-        returns (uint256)
-    {
+    /*
+     * 创建新的解质押请求（只能由质押合约调用）
+     * @param requester 请求者地址
+     * @param mETHLocked 锁定的mETH数量
+     * @param ethRequested 请求的ETH数量
+     * @return 请求ID
+     *
+     * 执行逻辑：
+     * 1. 计算新的累积ETH请求量
+     * 2. 创建请求对象并添加到队列
+     * 3. 更新状态变量并发出事件
+     */
+    function create(address requester, uint128 mETHLocked, uint128 ethRequested) external onlyStakingContract returns (uint256){
+        // 计算新的累积请求量 = 之前的累积量 + 当前请求量
+        // cumulativeETHRequested的作用：
+        // 1. 确定请求在队列中的位置
+        // 2. 判断是否有足够资金可以认领
+        // 3. 实现FIFO处理逻辑
         uint128 currentCumulativeETHRequested = latestCumulativeETHRequested + ethRequested;
+
+        // 请求ID就是数组的当前长度（从0开始）
         uint256 requestID = _unstakeRequests.length;
+
+        // 创建请求对象
         UnstakeRequest memory unstakeRequest = UnstakeRequest({
-            id: uint128(requestID),
-            requester: requester,
-            mETHLocked: mETHLocked,
-            ethRequested: ethRequested,
-            cumulativeETHRequested: currentCumulativeETHRequested,
-            blockNumber: uint64(block.number)
+            id: uint128(requestID),          // 请求 ID -在数组中的索引
+            requester: requester,            // 请求者地址
+            mETHLocked: mETHLocked,          // 锁定的 mETH 数量-将在认领时销毁
+            ethRequested: ethRequested,      // 请求的 ETH 数量
+            cumulativeETHRequested: currentCumulativeETHRequested,  // 创建该请求时的累积ETH请求量（关键！）
+            blockNumber: uint64(block.number)          // 请求创建时的区块号
         });
+
+        // 添加到队列并更新状态
         _unstakeRequests.push(unstakeRequest);
 
         latestCumulativeETHRequested = currentCumulativeETHRequested;
+
         emit UnstakeRequestCreated(
             requestID, requester, mETHLocked, ethRequested, currentCumulativeETHRequested, block.number
         );
         return requestID;
     }
 
-    /// @inheritdoc IUnstakeRequestsManagerWrite
-    /// @dev Verifies the requester's identity, finality of the request, and availability of funds before transferring
-    /// the requested ETH. The unstake request is then removed from the array.
+    /**
+     * 认领解质押请求（只能由质押合约调用）
+     * @param requestID 请求ID
+     * @param requester 请求者地址
+     *
+     * 认领条件（全部满足才能认领）：
+     * 1. 请求存在且未被认领
+     * 2. 调用者是请求的创建者
+     * 3. 请求已经确认（过了确认期）
+     * 4. 有足够的资金可以支付
+     */
     function claim(uint256 requestID, address requester) external onlyStakingContract {
         UnstakeRequest memory request = _unstakeRequests[requestID];
 
+        // 检查1：请求是否存在（已认领的请求会被删除，requester变为0）
         if (request.requester == address(0)) {
             revert AlreadyClaimed();
         }
 
+        // 检查2：权限验证
         if (requester != request.requester) {
             revert NotRequester();
         }
 
+        // 检查3：确认性验证（基于区块数和Oracle状态）
         if (!_isFinalized(request)) {
             revert NotFinalized();
         }
 
+        // 检查4：资金充足性验证
+        // 核心逻辑：请求的累积量 <= 已分配的资金量
         if (request.cumulativeETHRequested > allocatedETHForClaims) {
             revert NotEnoughFunds(request.cumulativeETHRequested, allocatedETHForClaims);
         }
 
-        delete _unstakeRequests[requestID];
-        totalClaimed += request.ethRequested;
+        // 执行认领
+        delete _unstakeRequests[requestID];       // 删除请求（防止重复认领）
+        totalClaimed += request.ethRequested;     // 更新已认领总额
 
         emit UnstakeRequestClaimed({
             id: requestID,
@@ -212,17 +227,24 @@ contract UnstakeRequestsManager is
             blockNumber: request.blockNumber
         });
 
-        // Claiming the request burns the locked mETH tokens from this contract.
-        // Note that it is intentional that burning happens here rather than at unstake time.
-        // Please see the docs folder for more information.
+        // 关键：在这里销毁锁定的mETH代币（而不是在请求创建时）
+        // 这样设计的原因：只有成功认领才真正销毁代币，失败的请求可以退还
         mETH.burn(request.mETHLocked);
 
+        // 转移 ETH 给用户
         Address.sendValue(payable(requester), request.ethRequested);
     }
 
-    /// @inheritdoc IUnstakeRequestsManagerWrite
-    /// @dev Iteratively checks the finality of the latest requests and cancels the unfinalized ones until reaching a
-    /// finalized request or the max loop bound. Adjusts the state of the latest cumulative ETH accordingly.
+    /**
+     * 紧急情况下取消未确认的请求
+     * @param maxCancel 最多取消的请求数量
+     * @return hasMore 是否还有更多未确认请求需要取消
+     *
+     * 使用场景：
+     * 1. 协议遇到紧急情况需要暂停
+     * 2. Oracle数据异常导致确认机制失效
+     * 3. 需要回收资金进行协议治理
+     */
     function cancelUnfinalizedRequests(uint256 maxCancel) external onlyRole(REQUEST_CANCELLER_ROLE) returns (bool) {
         uint256 length = _unstakeRequests.length;
         if (length == 0) {
@@ -233,20 +255,22 @@ contract UnstakeRequestsManager is
             maxCancel = length;
         }
 
-        // Cache all cancelled requests to perform the refunds after processing all local effects to strictly follow the
-        // checks-effects-interaction pattern.
+        // 缓存被取消的请求，遵循检查-效果-交互模式
         UnstakeRequest[] memory requests = new UnstakeRequest[](maxCancel);
 
-        // Find the number of requests that have not been finalized.
         uint256 numCancelled = 0;
         uint128 amountETHCancelled = 0;
+
+        // 从队列末尾开始取消（最新的请求）
         while (numCancelled < maxCancel) {
             UnstakeRequest memory request = _unstakeRequests[_unstakeRequests.length - 1];
 
+            // 如果遇到已确认的请求，停止取消
             if (_isFinalized(request)) {
                 break;
             }
 
+            // 从队列中移除并记录
             _unstakeRequests.pop();
             requests[numCancelled] = request;
             ++numCancelled;
@@ -262,12 +286,12 @@ contract UnstakeRequestsManager is
             );
         }
 
-        // Reset the latest cumulative ETH state
+        // 调整累积请求量状态
         if (amountETHCancelled > 0) {
             latestCumulativeETHRequested -= amountETHCancelled;
         }
 
-        // check whether there are more unfinalized requests to cancel.
+        // 检查是否还有更多未确认请求
         bool hasMore;
         uint256 remainingRequestsLength = _unstakeRequests.length;
         if (remainingRequestsLength == 0) {
@@ -277,7 +301,7 @@ contract UnstakeRequestsManager is
             hasMore = !_isFinalized(latestRemainingRequest);
         }
 
-        // Return the locked mETH of all cancelled requests.
+        // 退还被取消请求的 mETH （没有销毁，而是退还）
         for (uint256 i = 0; i < numCancelled; i++) {
             SafeERC20Upgradeable.safeTransfer(mETH, requests[i].requester, requests[i].mETHLocked);
         }
@@ -285,11 +309,26 @@ contract UnstakeRequestsManager is
         return hasMore;
     }
 
-    /// @inheritdoc IUnstakeRequestsManagerWrite
-    /// @dev Handles incoming ether from the staking contract, increasing the allocatedETHForClaims counter by the value
-    /// of the incoming allocatedETH.
+    /**
+     * 接收来自质押合约的ETH分配
+     * 这是FIFO队列得以工作的资金来源
+     *
+     * 工作原理：
+     * 1. 质押合约调用allocateETH()发送ETH
+     * 2. 增加allocatedETHForClaims余额
+     * 3. 使更多排队的请求变为可认领状态
+     */
     function allocateETH() external payable onlyStakingContract {
         allocatedETHForClaims += msg.value;
+        // 例子：假设当前队列状态
+        // 请求A：累积量100 ETH
+        // 请求B：累积量200 ETH
+        // 请求C：累积量350 ETH
+        //
+        // 如果 allocatedETHForClaims = 250 ETH：
+        // - 请求A可认领（100 <= 250）
+        // - 请求B可认领（200 <= 250）
+        // - 请求C不可认领（350 > 250）
     }
 
     /// @inheritdoc IUnstakeRequestsManagerWrite
@@ -314,20 +353,31 @@ contract UnstakeRequestsManager is
         return _unstakeRequests[requestID];
     }
 
-    /// @inheritdoc IUnstakeRequestsManagerRead
+    /**
+     * 查询请求的状态信息
+     * @param requestID 请求ID
+     * @return isFinalized 是否已确认
+     * @return claimableAmount 当前可认领的金额（可能部分认领）
+     *
+     * 这个函数很有用，用户可以：
+     * 1. 检查请求是否可以认领
+     * 2. 了解资金到位情况
+     * 3. 估算认领时间
+     */
     function requestInfo(uint256 requestID) external view returns (bool, uint256) {
         UnstakeRequest memory request = _unstakeRequests[requestID];
 
         bool isFinalized = _isFinalized(request);
         uint256 claimableAmount = 0;
 
-        // The cumulative ETH requested also includes the ETH requested and must be subtracted from the cumulative total
-        // to find partially filled amounts.
+        // 计算可认领金额的巧妙逻辑：
+        // 1. 请求前面需要的资金 = 请求累积量 - 请求自身金额
         uint256 allocatedEthRequired = request.cumulativeETHRequested - request.ethRequested;
+
+        // 2. 如果已分配资金 > 前面需要的资金，说明轮到这个请求了
         if (allocatedEthRequired < allocatedETHForClaims) {
-            // The allocatedETHForClaims increases over time whereas the request's cumulative ETH requested stays the
-            // same. This means the difference between the two will also increase over time. Given we only want to
-            // return the partially filled amount up to the full ETH requested, we take the minimum of the two.
+            // 3. 可认领金额 = min(超出部分, 请求金额)
+            // 这处理了部分资金到位的情况
             claimableAmount = Math.min(allocatedETHForClaims - allocatedEthRequired, request.ethRequested);
         }
         return (isFinalized, claimableAmount);
@@ -374,14 +424,25 @@ contract UnstakeRequestsManager is
         );
     }
 
-    /// @notice Used by the claim function to check whether the request can be claimed (i.e. is finalized).
-    /// @dev Finalization relies on the latest record of the oracle. This way, users can only claim their unstake
-    /// requests in a period where the protocol has a valid record. We also use numberOfBlocksToFinalize as another
-    /// safety buffer that can be set depending on the needs of the protocol.
-    /// See also {claim}
-    /// @return A boolean indicating whether the unstake request is finalized or not.
+    /**
+     * 检查请求是否已确认（可以认领）
+     * @param request 请求对象
+     * @return 是否已确认
+     *
+     * 确认条件（双重安全机制）：
+     * 1. 请求创建区块 + 确认区块数 <= Oracle最新记录的结束区块
+     * 2. 确保Oracle已经处理了请求创建之后的状态
+     */
     function _isFinalized(UnstakeRequest memory request) internal view returns (bool) {
-        return (request.blockNumber + numberOfBlocksToFinalize) <= oracle.latestRecord().updateEndBlock;
+        // 计算请求应该确认的区块号
+        uint256 finalizeAtBlock = request.blockNumber + numberOfBlocksToFinalize;
+
+        // Oracle的最新记录结束区块
+        uint256 oracleEndBlock = oracle.latestRecord().updateEndBlock;
+
+        // 只有Oracle处理到确认区块之后，请求才能被认领
+        // 这确保了协议有最新的状态信息来处理请求
+        return finalizeAtBlock <= oracleEndBlock;
     }
 
     /// @dev Validates that the caller is the staking contract.
