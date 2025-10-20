@@ -56,9 +56,7 @@ interface StakingEvents {
     event ReturnsReceived(uint256 amount);
 }
 
-/// @title Staking
-/// @notice Manages stake and unstake requests by users, keeps track of the total amount of ETH controlled by the
-/// protocol, and initiates new validators.
+// 核心概念，用户存入 ETH 获取 mETH 代币，当前协议将 ETH 发送给验证器进行质押获取收益
 contract Staking is Initializable, AccessControlEnumerableUpgradeable, IStaking, StakingEvents, ProtocolEvents {
     // Errors.
     error DoesNotReceiveETH();
@@ -83,17 +81,10 @@ contract Staking is Initializable, AccessControlEnumerableUpgradeable, IStaking,
     error InvalidWithdrawalCredentialsNotETH1(bytes12);
     error InvalidWithdrawalCredentialsWrongAddress(address);
 
-    /// @notice Role allowed trigger administrative tasks such as allocating funds to / withdrawing surplusses from the
-    /// UnstakeRequestsManager and setting various parameters on the contract.
-    bytes32 public constant STAKING_MANAGER_ROLE = keccak256("STAKING_MANAGER_ROLE");
-
-    /// @notice Role allowed to allocate funds to unstake requests manager and reserve funds to deposit into the
-    /// validators.
-    bytes32 public constant ALLOCATOR_SERVICE_ROLE = keccak256("ALLOCATER_SERVICE_ROLE");
-
-    /// @notice Role allowed to initiate new validators by sending funds from the allocatedETHForDeposits balance
-    /// to the beacon chain deposit contract.
-    bytes32 public constant INITIATOR_SERVICE_ROLE = keccak256("INITIATOR_SERVICE_ROLE");
+    // 角色权限定义
+    bytes32 public constant STAKING_MANAGER_ROLE = keccak256("STAKING_MANAGER_ROLE");  // 质押管理员角色
+    bytes32 public constant ALLOCATOR_SERVICE_ROLE = keccak256("ALLOCATER_SERVICE_ROLE");     // 资金分配管理员角色
+    bytes32 public constant INITIATOR_SERVICE_ROLE = keccak256("INITIATOR_SERVICE_ROLE");   // 验证器启动员角色
 
     /// @notice Role to manage the staking allowlist.
     bytes32 public constant STAKING_ALLOWLIST_MANAGER_ROLE = keccak256("STAKING_ALLOWLIST_MANAGER_ROLE");
@@ -120,59 +111,17 @@ contract Staking is Initializable, AccessControlEnumerableUpgradeable, IStaking,
     /// assumption of this contract and the related off-chain accounting.
     mapping(bytes pubkey => bool exists) public usedValidators;
 
-    /// @inheritdoc IStakingInitiationRead
-    /// @dev This is needed to account for ETH that is still in flight, i.e. that has been sent to the deposit contract
-    /// but has not been processed by the beacon chain yet. Once the off-chain oracle detects those deposits, they are
-    /// recorded as `totalDepositsProcessed` in the oracle contract to avoid double counting. See also
-    /// {totalControlled}.
-    uint256 public totalDepositedInValidators;
+    // 资金池状态
+    uint256 public unallocatedETH;                 // 未分配的 ETH，用户质押但还未分配用途的ETH
+    uint256 public allocatedETHForDeposits;        // 已分配用于启动验证器的 ETH
+    uint256 public totalDepositedInValidators;     // 已发送给验证器的ETH总量
+    uint256 public numInitiatedValidators;         // 已启动的验证器数量
 
-    /// @inheritdoc IStakingInitiationRead
-    uint256 public numInitiatedValidators;
+    uint256 public minimumStakeBound;              // 用户质押 ETH 的最小数量
+    uint256 public minimumUnstakeBound;            // 用户解质押 mETH 的最小数量
 
-    /// @notice The amount of ETH that is used to allocate to deposits and fill the pending unstake requests.
-    uint256 public unallocatedETH;
-
-    /// @notice The amount of ETH that is used deposit into validators.
-    uint256 public allocatedETHForDeposits;
-
-    /// @notice The minimum amount of ETH users can stake.
-    uint256 public minimumStakeBound;
-
-    /// @notice The minimum amount of mETH users can unstake.
-    uint256 public minimumUnstakeBound;
-
-    /// @notice When staking on Ethereum, validators must go through an entry queue to bring money into the system, and
-    /// an exit queue to bring it back out. The entry queue increases in size as more people want to stake. While the
-    /// money is in the entry queue, it is not earning any rewards. When a validator is active, or in the exit queue, it
-    /// is earning rewards. Once a validator enters the entry queue, the only way that the money can be retrieved is by
-    /// waiting for it to become active and then to exit it again. As of July 2023, the entry queue is approximately 40
-    /// days and the exit queue is 0 days (with ~6 days of processing time).
-    ///
-    /// In a non-optimal scenario for the protocol, a user could stake (for example) 32 ETH to receive mETH, wait
-    /// until a validator enters the queue, and then request to unstake to recover their 32 ETH. Now we have 32 ETH in
-    /// the system which affects the exchange rate, but is not earning rewards.
-    ///
-    /// In this case, the 'fair' thing to do would be to make the user wait for the queue processing to finish before
-    /// returning their funds. Because the tokens are fungible however, we have no way of matching 'pending' stakes to a
-    /// particular user. This means that in order to fulfill unstake requests quickly, we must exit a different
-    /// validator to return the user's funds. If we exit a validator, we can return the funds after ~5 days, but the
-    /// original 32 ETH will not be earning for another 35 days, leading to a small but repeatable socialised loss of
-    /// efficiency for the protocol. As we can only exit validators in chunks of 32 ETH, this case is also exacerbated
-    /// by a user unstaking smaller amounts of ETH.
-    ///
-    /// To compensate for the fact that these two queues differ in length, we apply an adjustment to the exchange rate
-    /// to reflect the difference and mitigate its effect on the protocol. This protects the protocol from the case
-    /// above, and also from griefing attacks following the same principle. Essentially, when you stake you are
-    /// receiving a value of mETH that discounts ~35 days worth of rewards in return for being able to access your
-    /// money without waiting the full 40 days when unstaking. As the adjustment is applied to the exchange rate, this
-    /// results in a small 'improvement' to the rate for all existing stakers (i.e. it is not a fee levied by the
-    /// protocol itself).
-    ///
-    /// As the adjustment is applied to the exchange rate, the result is reflected in any user interface which shows the
-    /// amount of mETH received when staking, meaning there is no surprise for users when staking or unstaking.
-    /// @dev The value is in basis points (1/10000).
-    uint16 public exchangeAdjustmentRate;
+    // 汇率调整机制（重要！）
+    uint16 public exchangeAdjustmentRate;          // 汇率调整率，用于补偿以太坊2.0进入和退出队列时间差
 
     /// @dev A basis point (often denoted as bp, 1bp = 0.01%) is a unit of measure used in finance to describe
     /// the percentage change in a financial instrument. This is a constant value set as 10000 which represents
@@ -292,46 +241,60 @@ contract Staking is Initializable, AccessControlEnumerableUpgradeable, IStaking,
         maximumMETHSupply = 1024 ether;
     }
 
-    /// @notice Interface for users to stake their ETH with the protocol. Note: when allowlist is enabled, only users
-    /// with the allowlist can stake.
-    /// @dev Mints the corresponding amount of mETH (relative to the stake's share in the total ETH controlled by the
-    /// protocol) to the user.
-    /// @param minMETHAmount The minimum amount of mETH that the user expects to receive in return.
+    /**
+     * 用户质押ETH换取mETH代币
+     * @param minMETHAmount 用户期望获得的最少mETH数量（防滑点保护）
+     *
+     * 执行逻辑：
+     * 1. 检查是否暂停、白名单权限、最小质押金额
+     * 2. 计算能获得的mETH数量（考虑汇率调整）
+     * 3. 检查是否超过最大mETH供应量限制
+     * 4. 将ETH添加到未分配资金池
+     * 5. 铸造mETH给用户
+     */
     function stake(uint256 minMETHAmount) external payable {
+        // 暂停检查
         if (pauser.isStakingPaused()) {
             revert Paused();
         }
 
+        // 白名单检查（如果启用）
         if (isStakingAllowlist) {
             _checkRole(STAKING_ALLOWLIST_ROLE);
         }
 
+        // 最小金额检查
         if (msg.value < minimumStakeBound) {
             revert MinimumStakeBoundNotSatisfied();
         }
 
+        //!! 汇率计算 - 这里非常重要
         uint256 mETHMintAmount = ethToMETH(msg.value);
+
+        // 供给量检查
         if (mETHMintAmount + mETH.totalSupply() > maximumMETHSupply) {
             revert MaximumMETHSupplyExceeded();
         }
+
+        // 滑点保护
         if (mETHMintAmount < minMETHAmount) {
             revert StakeBelowMinimumMETHAmount(mETHMintAmount, minMETHAmount);
         }
 
-        // Increment unallocated ETH after calculating the exchange rate to ensure
-        // a consistent rate.
+        // Increment unallocated ETH after calculating the exchange rate to ensure a consistent rate.
+        // 先计算汇率再更新余额，确保汇率一致性
         unallocatedETH += msg.value;
 
         emit Staked(msg.sender, msg.value, mETHMintAmount);
         mETH.mint(msg.sender, mETHMintAmount);
     }
 
-    /// @notice Interface for users to submit a request to unstake.
-    /// @dev Transfers the specified amount of mETH to the staking contract and locks it there until it is burned on
-    /// request claim. The staking contract must therefore be approved to move the user's mETH on their behalf.
-    /// @param methAmount The amount of mETH to unstake.
-    /// @param minETHAmount The minimum amount of ETH that the user expects to receive.
-    /// @return The request ID.
+    /**
+     * 用户提交解质押请求（注意：不是立即解质押！）
+     * @param methAmount 要解质押的mETH数量
+     * @param minETHAmount 期望获得的最少ETH数量
+     * @return 请求ID
+     */
     function unstakeRequest(uint128 methAmount, uint128 minETHAmount) external returns (uint256) {
         return _unstakeRequest(methAmount, minETHAmount);
     }
@@ -352,10 +315,13 @@ contract Staking is Initializable, AccessControlEnumerableUpgradeable, IStaking,
         return _unstakeRequest(methAmount, minETHAmount);
     }
 
-    /// @notice Processes a user's request to unstake by transferring the corresponding mETH to the staking contract
-    /// and creating the request on the unstake requests manager.
-    /// @param methAmount The amount of mETH to unstake.
-    /// @param minETHAmount The minimum amount of ETH that the user expects to receive.
+    /**
+     * 执行逻辑：
+     * 1. 检查暂停状态和最小解质押金额
+     * 2. 计算能获得的ETH数量
+     * 3. 在 UnstakeRequestsManager 中创建请求
+     * 4. 将 mETH 转移到 UnstakeRequestsManager 锁定
+     */
     function _unstakeRequest(uint128 methAmount, uint128 minETHAmount) internal returns (uint256) {
         if (pauser.isUnstakeRequestsAndClaimsPaused()) {
             revert Paused();
@@ -365,15 +331,24 @@ contract Staking is Initializable, AccessControlEnumerableUpgradeable, IStaking,
             revert MinimumUnstakeBoundNotSatisfied();
         }
 
+        // 汇率计算
         uint128 ethAmount = uint128(mETHToETH(methAmount));
+
+        // 滑点保护
         if (ethAmount < minETHAmount) {
             revert UnstakeBelowMinimumETHAmount(ethAmount, minETHAmount);
         }
 
-        uint256 requestID =
-            unstakeRequestsManager.create({requester: msg.sender, mETHLocked: methAmount, ethRequested: ethAmount});
+        // 创建请求
+        uint256 requestID = unstakeRequestsManager.create({
+            requester: msg.sender,
+            mETHLocked: methAmount,
+            ethRequested: ethAmount
+        });
+
         emit UnstakeRequested({id: requestID, staker: msg.sender, ethAmount: ethAmount, mETHLocked: methAmount});
 
+        // 将 mETH 锁定到请求管理器
         SafeERC20Upgradeable.safeTransferFrom(mETH, msg.sender, address(unstakeRequestsManager), methAmount);
 
         return requestID;
@@ -407,41 +382,51 @@ contract Staking is Initializable, AccessControlEnumerableUpgradeable, IStaking,
         unstakeRequestsManager.withdrawAllocatedETHSurplus();
     }
 
-    /// @notice Allocates ETH from the unallocatedETH balance to the unstake requests manager to fill pending requests
-    /// and adds to the allocatedETHForDeposits balance that is used to initiate new validators.
-    function allocateETH(uint256 allocateToUnstakeRequestsManager, uint256 allocateToDeposits)
-        external
-        onlyRole(ALLOCATOR_SERVICE_ROLE)
-    {
+    /**
+     * 将未分配的ETH分配到两个用途：解质押请求和验证器启动
+     * @param allocateToUnstakeRequestsManager 分配给解质押请求的ETH
+     * @param allocateToDeposits 分配给验证器启动的ETH
+     *
+     * 这个函数很重要！它管理着协议的资金流向：
+     * - 用户质押的ETH首先进入unallocatedETH池
+     * - 通过这个函数将资金分配到具体用途
+     * - 保证资金既能满足用户解质押，又能启动新验证器获得收益
+     */
+    function allocateETH(uint256 allocateToUnstakeRequestsManager, uint256 allocateToDeposits) external onlyRole(ALLOCATOR_SERVICE_ROLE) {
         if (pauser.isAllocateETHPaused()) {
             revert Paused();
         }
 
+        // 检查是否有足够的未分配 ETH
         if (allocateToUnstakeRequestsManager + allocateToDeposits > unallocatedETH) {
             revert NotEnoughUnallocatedETH();
         }
 
+        // 从未分配池中扣除
         unallocatedETH -= allocateToUnstakeRequestsManager + allocateToDeposits;
 
+        // 分配给验证器启动
         if (allocateToDeposits > 0) {
             allocatedETHForDeposits += allocateToDeposits;
             emit AllocatedETHToDeposits(allocateToDeposits);
         }
 
+        // 分配给解质押管理器并立即发送ETH
         if (allocateToUnstakeRequestsManager > 0) {
             emit AllocatedETHToUnstakeRequestsManager(allocateToUnstakeRequestsManager);
             unstakeRequestsManager.allocateETH{value: allocateToUnstakeRequestsManager}();
         }
     }
 
-    /// @notice Initiates new validators by sending ETH to the beacon chain deposit contract.
-    /// @dev Cannot initiate the same validator (public key) twice. Since BLS signatures cannot be feasibly verified on
-    /// the EVM, the caller must carefully make sure that the sent payloads (public keys + signatures) are correct,
-    /// otherwise the sent ETH will be lost.
-    function initiateValidatorsWithDeposits(ValidatorParams[] calldata validators, bytes32 expectedDepositRoot)
-        external
-        onlyRole(INITIATOR_SERVICE_ROLE)
-    {
+    /*
+     * 启动新验证器，将ETH发送到以太坊存款合约
+     * @param validators 验证器参数数组
+     * @param expectedDepositRoot 期望的存款根（防MEV攻击）
+     *
+     * 这是协议获得收益的关键步骤！
+     * 将分配的ETH发送给以太坊2.0验证器开始质押
+     */
+    function initiateValidatorsWithDeposits(ValidatorParams[] calldata validators, bytes32 expectedDepositRoot) external onlyRole(INITIATOR_SERVICE_ROLE) {
         if (pauser.isInitiateValidatorsPaused()) {
             revert Paused();
         }
@@ -449,24 +434,24 @@ contract Staking is Initializable, AccessControlEnumerableUpgradeable, IStaking,
             return;
         }
 
-        // Check that the deposit root matches the given value. This ensures that the deposit contract state
-        // has not changed since the transaction was submitted, which means that a rogue node operator cannot
-        // front-run deposit transactions.
+        // 防止MEV攻击：检查存款根是否匹配
         bytes32 actualRoot = depositContract.get_deposit_root();
         if (expectedDepositRoot != actualRoot) {
             revert InvalidDepositRoot(actualRoot);
         }
 
-        // First loop is to check that all validators are valid according to our constraints and we record the
-        // validators and how much we have deposited.
         uint256 amountDeposited = 0;
+
+        // 第一轮循环：验证所有验证器参数并记录
         for (uint256 i = 0; i < validators.length; ++i) {
             ValidatorParams calldata validator = validators[i];
 
+            // 防止重复启动同一个验证器
             if (usedValidators[validator.pubkey]) {
                 revert PreviouslyUsedValidator();
             }
 
+            // 检查存款金额范围
             if (validator.depositAmount < minimumDepositAmount) {
                 revert MinimumValidatorDepositNotSatisfied();
             }
@@ -475,8 +460,10 @@ contract Staking is Initializable, AccessControlEnumerableUpgradeable, IStaking,
                 revert MaximumValidatorDepositExceeded();
             }
 
+            // 验证提取凭证必须指向协议钱包
             _requireProtocolWithdrawalAccount(validator.withdrawalCredentials);
 
+            // 标记为已使用并累计金额
             usedValidators[validator.pubkey] = true;
             amountDeposited += validator.depositAmount;
 
@@ -488,16 +475,17 @@ contract Staking is Initializable, AccessControlEnumerableUpgradeable, IStaking,
             });
         }
 
+        // 检查是否有足够的已分配ETH
         if (amountDeposited > allocatedETHForDeposits) {
             revert NotEnoughDepositETH();
         }
 
+        // 更新状态变量
         allocatedETHForDeposits -= amountDeposited;
         totalDepositedInValidators += amountDeposited;
         numInitiatedValidators += validators.length;
 
-        // Second loop is to send the deposits to the deposit contract. Keeps external calls to the deposit contract
-        // separate from state changes.
+        // 第二轮循环：向存款合约发送ETH（分离状态更新和外部调用）
         for (uint256 i = 0; i < validators.length; ++i) {
             ValidatorParams calldata validator = validators[i];
             depositContract.deposit{value: validator.depositAmount}({
@@ -524,24 +512,23 @@ contract Staking is Initializable, AccessControlEnumerableUpgradeable, IStaking,
         unallocatedETH += msg.value;
     }
 
-    /// @notice Converts from mETH to ETH using the current exchange rate.
-    /// The exchange rate is given by the total supply of mETH and total ETH controlled by the protocol.
+    /*
+     * ETH转mETH汇率计算（质押时使用）
+     * 这里包含了协议的核心创新：汇率调整机制！
+     */
     function ethToMETH(uint256 ethAmount) public view returns (uint256) {
-        // 1:1 exchange rate on the first stake.
-        // Using `METH.totalSupply` over `totalControlled` to check if the protocol is in its bootstrap phase since
-        // the latter can be manipulated, for example by transferring funds to the `ExecutionLayerReturnsReceiver`, and
-        // therefore be non-zero by the time the first stake is made
+        // 首次质押时 1:1 汇率
         if (mETH.totalSupply() == 0) {
             return ethAmount;
         }
 
-        // deltaMETH = (1 - exchangeAdjustmentRate) * (mETHSupply / totalControlled) * ethAmount
-        // This rounds down to zero in the case of `(1 - exchangeAdjustmentRate) * ethAmount * mETHSupply <
-        // totalControlled`.
-        // While this scenario is theoretically possible, it can only be realised feasibly during the protocol's
-        // bootstrap phase and if `totalControlled` and `mETHSupply` can be changed independently of each other. Since
-        // the former is permissioned, and the latter is not permitted by the protocol, this cannot be exploited by an
-        // attacker.
+        // 核心公式：deltaMETH = (1 - exchangeAdjustmentRate) * (mETHSupply / totalControlled) * ethAmount
+        //
+        // 这里的exchangeAdjustmentRate是关键创新：
+        // - 以太坊2.0进入队列约40天（无收益）
+        // - 退出队列约6天（有收益）
+        // - 为了防止"快进快出"攻击，质押时给予约35天收益的折扣
+        // - 这保护了协议和现有质押者的利益
         return Math.mulDiv(
             ethAmount,
             mETH.totalSupply() * uint256(_BASIS_POINTS_DENOMINATOR - exchangeAdjustmentRate),
@@ -549,37 +536,42 @@ contract Staking is Initializable, AccessControlEnumerableUpgradeable, IStaking,
         );
     }
 
-    /// @notice Converts from ETH to mETH using the current exchange rate.
-    /// The exchange rate is given by the total supply of mETH and total ETH controlled by the protocol.
+    /*
+     * mETH转ETH汇率计算（解质押时使用）
+     * 注意：解质押时不应用调整率，按实际价值计算
+     */
     function mETHToETH(uint256 mETHAmount) public view returns (uint256) {
         // 1:1 exchange rate on the first stake.
-        // Using `METH.totalSupply` over `totalControlled` to check if the protocol is in its bootstrap phase since
-        // the latter can be manipulated, for example by transferring funds to the `ExecutionLayerReturnsReceiver`, and
-        // therefore be non-zero by the time the first stake is made
         if (mETH.totalSupply() == 0) {
             return mETHAmount;
         }
 
-        // deltaETH = (totalControlled / mETHSupply) * mETHAmount
-        // This rounds down to zero in the case of `mETHAmount * totalControlled < mETHSupply`.
-        // While this scenario is theoretically possible, it can only be realised feasibly during the protocol's
-        // bootstrap phase and if `totalControlled` and `mETHSupply` can be changed independently of each other. Since
-        // the former is permissioned, and the latter is not permitted by the protocol, this cannot be exploited by an
-        // attacker.
+        // 简单公式：deltaETH = (totalControlled / mETHSupply) * mETHAmount
         return Math.mulDiv(mETHAmount, totalControlled(), mETH.totalSupply());
     }
 
-    /// @notice The total amount of ETH controlled by the protocol.
-    /// @dev Sums over the balances of various contracts and the beacon chain information from the oracle.
+    /*
+     * 计算协议控制的 ETH 总量
+     * 这是汇率计算的基础，必须准确反映所有ETH的分布状态
+     */
     function totalControlled() public view returns (uint256) {
         OracleRecord memory record = oracle.latestRecord();
         uint256 total = 0;
+
+        // 1. 未分配的ETH（用户质押还未分配用途）
         total += unallocatedETH;
+
+        // 2. 已分配给验证器启动但还未发送的ETH
         total += allocatedETHForDeposits;
-        /// The total ETH deposited to the beacon chain must be decreased by the deposits processed by the off-chain
-        /// oracle since it will be accounted for in the currentTotalValidatorBalance from that point onwards.
+
+        // 3. 已发送但还未被Oracle处理的ETH（在途资金）
+        // 注意：要减去Oracle已处理的部分避免重复计算
         total += totalDepositedInValidators - record.cumulativeProcessedDepositAmount;
+
+        // 4. Oracle报告的验证器余额（包含本金+收益）
         total += record.currentTotalValidatorBalance;
+
+        // 5. 解质押请求管理器中的ETH
         total += unstakeRequestsManager.balance();
         return total;
     }
