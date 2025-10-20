@@ -27,8 +27,7 @@ interface OracleQuorumManagerEvents {
     event OracleRecordReceivedError(bytes reason);
 }
 
-/// @title OracleQuorumManager
-/// @notice Responsible for managing the quorum of oracle reporters.
+// 是Oracle系统的**共识协调层**，负责管理多个Oracle服务的报告，确保只有在达成共识后才将数据转发给Oracle合约进行最终验证。 `OracleQuorumManager`
 contract OracleQuorumManager is
     Initializable,
     AccessControlEnumerableUpgradeable,
@@ -39,21 +38,15 @@ contract OracleQuorumManager is
     error AlreadyReporter();
     error RelativeThresholdExceedsOne();
 
-    /// @notice Oracle manager role can update properties in the OracleQuorumManager.
-    bytes32 public constant QUORUM_MANAGER_ROLE = keccak256("QUORUM_MANAGER_ROLE");
-
-    /// @notice Any reporter modifier can change the set of oracle services which can produce a valid
-    /// oracle report. This means that this is quite a crucial role and should have elevated access
-    /// requirements.
-    bytes32 public constant REPORTER_MODIFIER_ROLE = keccak256("REPORTER_MODIFIER_ROLE");
-
-    /// @notice The service oracle reporter role is used to identify which oracle services can
-    /// produce a valid oracle report. Note that granting this role to an address may have consequences
-    /// for the logic of the contract - e.g. the contract may calculate quorum based on the number of
-    /// members in this set. So you should not add the role to anything other than an oracle service.
-    /// @dev To discover all oracle services, you can use `getRoleMemberCount`and
-    /// getRoleMember(role, N)` (on the same block).
-    bytes32 public constant SERVICE_ORACLE_REPORTER = keccak256("SERVICE_ORACLE_REPORTER");
+    /*
+     * 三层权限控制
+     * 被设置为 的admin `REPORTER_MODIFIER_ROLE``SERVICE_ORACLE_REPORTER`
+     * 这意味着只有具备高级权限的账户才能添加/移除Oracle服务
+     * 防止恶意Oracle服务自我授权或相互授权
+     */
+    bytes32 public constant QUORUM_MANAGER_ROLE = keccak256("QUORUM_MANAGER_ROLE"); // 参数管理
+    bytes32 public constant REPORTER_MODIFIER_ROLE = keccak256("REPORTER_MODIFIER_ROLE"); // Oracle服务管理
+    bytes32 public constant SERVICE_ORACLE_REPORTER = keccak256("SERVICE_ORACLE_REPORTER"); // 报告提交
 
     /// @dev A basis point (often denoted as bp, 1bp = 0.01%) is a unit of measure used in finance to describe
     /// the percentage change in a financial instrument. This is a constant value set as 10000 which represents
@@ -63,11 +56,9 @@ contract OracleQuorumManager is
     /// @notice Oracle to finalize reports for.
     IOracle public oracle;
 
-    /// @notice Report hashes by block by reporter.
-    /// This can be used for a reporter to verify a record computation and update it in case of an error.
+    // 双层映射：区块号 -> 报告者 -> 报告哈希
     mapping(uint64 block => mapping(address reporter => bytes32 recordHash)) public reporterRecordHashesByBlock;
-
-    /// @notice The number of times a record hash has been reported for a block.
+    // 双层映射：区块号 -> 报告哈希 -> 投票计数
     mapping(uint64 block => mapping(bytes32 recordHash => uint256)) public recordHashCountByBlock;
 
     /// @notice The target number of blocks in a report window.
@@ -120,22 +111,16 @@ contract OracleQuorumManager is
         relativeThresholdBasisPoints = 0;
     }
 
-    /// @notice Determines if a given record hash has reached quorum for a given block.
-    /// @dev True if the number of reporters agreeing on the record hash is greater than or equal to the absolute and
-    /// relative threshold.
-    /// @param blockNumber The block number.
-    /// @param recordHash The record hash.
+    // 双重阈值系统
     function _hasReachedQuroum(uint64 blockNumber, bytes32 recordHash) internal view returns (bool) {
         uint256 numReports = recordHashCountByBlock[blockNumber][recordHash];
         uint256 numReporters = getRoleMemberCount(SERVICE_ORACLE_REPORTER);
 
-        return (numReports >= absoluteThreshold)
-            && (numReports * _BASIS_POINTS_DENOMINATOR >= numReporters * relativeThresholdBasisPoints);
+        return (numReports >= absoluteThreshold)  // 绝对阈值：至少N个同意
+            && (numReports * _BASIS_POINTS_DENOMINATOR >= numReporters * relativeThresholdBasisPoints);  // // 相对阈值：至少X%同意
     }
 
-    /// @notice Determines if a record with given end block number has already been received by the oracle.
-    /// @dev This includes added and pending records.
-    /// @param updateEndBlock The end block number.
+    //防重放攻击，- 确保同一区块的报告只被Oracle处理一次，- 考虑了pending状态，避免竞态条件
     function _wasReceivedByOracle(uint256 updateEndBlock) internal view returns (bool) {
         return oracle.latestRecord().updateEndBlock >= updateEndBlock
             || (oracle.hasPendingUpdate() && oracle.pendingUpdate().updateEndBlock >= updateEndBlock);
@@ -148,56 +133,50 @@ contract OracleQuorumManager is
         return reporterRecordHashesByBlock[blockNumber][sender];
     }
 
-    /// @notice Tracks received records to determine consensus.
-    /// @param reporter The address of the off-chain service that submitted the record.
-    /// @param record The received record.
+    // 智能报告追踪
     function _trackReceivedRecord(address reporter, OracleRecord calldata record) internal returns (bytes32) {
         bytes32 newHash = keccak256(abi.encode(record));
         emit ReportReceived(record.updateEndBlock, reporter, newHash, record);
 
         bytes32 previousHash = reporterRecordHashesByBlock[record.updateEndBlock][reporter];
         if (newHash == previousHash) {
-            return newHash;
+            return newHash;  // 重复提交，直接返回
         }
 
         if (previousHash != 0) {
+            // Oracle修改了报告，需要更新计数
             recordHashCountByBlock[record.updateEndBlock][previousHash] -= 1;
         }
 
-        // Record the hash of the data for this report.
+        // 记录新的报告
         recordHashCountByBlock[record.updateEndBlock][newHash] += 1;
         reporterRecordHashesByBlock[record.updateEndBlock][reporter] = newHash;
 
         return newHash;
     }
 
-    /// @notice Receives an oracle report.
-    /// @dev This function should be called by the oracle service.
-    /// We explicitly allow oracles to 'update' their report for a given block. This allows repairs
-    /// in the case of inconsistency without requiring a new window to be started.
-    /// This function deliberately never reverts to log all reports received as events for off-chain performance metrics
-    /// and to simplify the interaction with the oracle services.
-    /// @param record The new oracle record update.
+    // 报告接收与处理
     function receiveRecord(OracleRecord calldata record) external onlyRole(SERVICE_ORACLE_REPORTER) {
+        //  第一步：记录和追踪报告
         bytes32 recordHash = _trackReceivedRecord(msg.sender, record);
 
+
+        // 第二步：检查是否达成共识
         if (!_hasReachedQuroum(record.updateEndBlock, recordHash)) {
-            return;
+            return;  // 未达成共识，等待更多报告
         }
 
+        // 第三步：避免重复提交
         if (_wasReceivedByOracle(record.updateEndBlock)) {
-            // This branch will be taken if the reporter submits their report after quorum has already been reached,
-            // e.g. the 3rd reporter in a 2/3 threshold setting.
-            return;
+            return;  // Oracle已处理此区块的报告
         }
 
         emit ReportQuorumReached(record.updateEndBlock);
 
-        // Deliberately not reverting to simplify the integration in off-chain oracle services, but wrapping any oracle
-        // errors as events for observability.
+        // 第四步：转发给Oracle合约
         try oracle.receiveRecord(record) {}
         catch (bytes memory reason) {
-            emit OracleRecordReceivedError(reason);
+            emit OracleRecordReceivedError(reason); //  记录错误但不中断
         }
     }
 
@@ -214,19 +193,13 @@ contract OracleQuorumManager is
         );
     }
 
-    /// @notice Sets the absolute and relative thresholds (i.e. the number of reporters that have to agree) for a report
-    /// to be accepted.
-    /// @param absoluteThreshold_ The new absolute threshold which sets the absoluteThreshold.
-    /// See also {absoluteThreshold}
-    /// @param relativeThresholdBasisPoints_ The new relative threshold in basis points which sets the
-    /// relativeThresholdBasisPoints.
-    /// See also {relativeThresholdBasisPoints}
+    // 灵活的阈值配置
     function setQuorumThresholds(uint16 absoluteThreshold_, uint16 relativeThresholdBasisPoints_)
         external
         onlyRole(QUORUM_MANAGER_ROLE)
     {
         if (relativeThresholdBasisPoints_ > _BASIS_POINTS_DENOMINATOR) {
-            revert RelativeThresholdExceedsOne();
+            revert RelativeThresholdExceedsOne();  // 相对阈值不能超过100%
         }
 
         emit ProtocolConfigChanged(
